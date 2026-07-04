@@ -5,6 +5,7 @@ public enum ImageUploadSessionStatus {
     UPLOADING,
     UPLOADED,
     PROCESSING,
+    READY,
     COMPLETED,
     FAILED,
     EXPIRED

@@ -6,17 +6,25 @@ import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 import team.unibusk.backend.domain.applicationguide.domain.ApplicationGuide;
 import team.unibusk.backend.domain.applicationguide.domain.ApplicationGuideRepository;
 import team.unibusk.backend.domain.performanceLocation.application.dto.UploadDto;
 import team.unibusk.backend.domain.performanceLocation.application.dto.response.PerformanceLocationExcelResponse;
+import team.unibusk.backend.domain.performanceLocation.domain.ImageUploadItem;
+import team.unibusk.backend.domain.performanceLocation.domain.ImageUploadItemStatus;
+import team.unibusk.backend.domain.performanceLocation.domain.ImageUploadSession;
 import team.unibusk.backend.domain.performanceLocation.domain.PerformanceLocation;
 import team.unibusk.backend.domain.performanceLocation.domain.PerformanceLocationImage;
 import team.unibusk.backend.domain.performanceLocation.domain.PerformanceLocationRepository;
-import team.unibusk.backend.global.file.application.FileUploadService;
+import team.unibusk.backend.domain.performanceLocation.infrastructure.ImageUploadItemJpaRepository;
+import team.unibusk.backend.domain.performanceLocation.infrastructure.ImageUploadSessionJpaRepository;
 import team.unibusk.backend.global.geocoding.application.GeocodingService;
 import team.unibusk.backend.global.geocoding.application.dto.Coordinate;
 
@@ -32,20 +40,23 @@ public class PerformanceLocationExcelService {
     private final PerformanceLocationRepository performanceLocationRepository;
     private final ApplicationGuideRepository applicationGuideRepository;
     private final GeocodingService geocodingService;
-    private final FileUploadService fileUploadService;
+    private final ImageUploadItemJpaRepository imageUploadItemRepository;
+    private final ImageUploadSessionJpaRepository imageUploadSessionRepository;
+    private final ImageUploadStorageService imageUploadStorageService;
+    private final PlatformTransactionManager transactionManager;
 
-    private static final String PERFORMANCELOCATION_FOLDER = "performanceLocations";
     private static final DataFormatter FORMATTER = new DataFormatter();
 
     @Transactional
-    public PerformanceLocationExcelResponse uploadPerformanceLocationExcelData(MultipartFile excelFile, List<MultipartFile> images) throws IOException {
+    public PerformanceLocationExcelResponse uploadPerformanceLocationExcelData(MultipartFile excelFile, Long uploadSessionId) throws IOException {
 
         // 검증 및 데이터 준비
         validateExcelFile(excelFile);
         List<UploadDto> dtos = getExcelDtoFromExcel(excelFile);
-        Map<String, MultipartFile> imageMap = createImageMap(images);
+        Map<String, ImageUploadItem> imageMap = createReadyImageMap(uploadSessionId);
 
         List<String> failedLogs = new ArrayList<>();
+        List<FinalizeImageTask> finalizeImageTasks = new ArrayList<>();
         int successCount = 0;
 
         // 각 행별 순차 처리
@@ -64,13 +75,24 @@ public class PerformanceLocationExcelService {
 
                 // [이미지 처리] 엑셀 파일명에 맞는 이미지 찾기 및 S3 업로드
                 String s3Url = null;
+                ImageUploadItem matchedImage = null;
+                String finalObjectKey = null;
                 if (StringUtils.hasText(dto.imageUrl())) {
-                    MultipartFile matchedImage = getMatchedImageFile(dto.imageUrl(), imageMap);
-                    s3Url = fileUploadService.upload(matchedImage, PERFORMANCELOCATION_FOLDER);
+                    matchedImage = getMatchedImageFile(dto.imageUrl(), imageMap);
+                    finalObjectKey = imageUploadStorageService.createFinalObjectKey(matchedImage);
+                    s3Url = imageUploadStorageService.createPublicUrl(finalObjectKey);
                 }
 
                 // [최종 저장] DB에 엔티티 저장
-                saveEntity(dto, coordinate, s3Url);
+                PerformanceLocation savedLocation = saveEntity(dto, coordinate, null);
+                if (matchedImage != null) {
+                    finalizeImageTasks.add(new FinalizeImageTask(
+                            savedLocation.getId(),
+                            matchedImage.getId(),
+                            finalObjectKey,
+                            s3Url
+                    ));
+                }
                 successCount++;
 
             } catch (DataIntegrityViolationException e) {
@@ -82,6 +104,7 @@ public class PerformanceLocationExcelService {
         }
 
         printFinalReport(successCount, failedLogs);
+        registerFinalizeImagesAfterCommit(finalizeImageTasks, uploadSessionId);
 
         return PerformanceLocationExcelResponse.builder()
                 .successCount(successCount)
@@ -136,21 +159,135 @@ public class PerformanceLocationExcelService {
         return (cell == null) ? "" : FORMATTER.formatCellValue(cell).trim();
     }
 
-    private Map<String, MultipartFile> createImageMap(List<MultipartFile> imageFolder) {
-        if (imageFolder == null) return Collections.emptyMap();
-        return imageFolder.stream()
-                .filter(file -> !file.isEmpty() && StringUtils.hasText(file.getOriginalFilename()))
-                .collect(Collectors.toMap(MultipartFile::getOriginalFilename, f -> f, (e, r) -> e));
-    }
+  private Map<String, ImageUploadItem> createReadyImageMap(Long uploadSessionId) {
+      if (uploadSessionId == null) return Collections.emptyMap();
+      return imageUploadItemRepository.findBySessionId(uploadSessionId).stream()
+              .filter(item -> item.getStatus() == ImageUploadItemStatus.READY)
+              .collect(Collectors.toMap(
+                      item -> normalizeFileName(item.getOriginalFileName()),
+                      item -> item,
+                      (existing, replacement) -> existing
+              ));
+  }
 
-    private MultipartFile getMatchedImageFile(String imageUrl, Map<String, MultipartFile> imageMap) {
-        for (Map.Entry<String, MultipartFile> entry : imageMap.entrySet()) {
+  private void completeUploadSessionIfAllImagesFinalized(Long uploadSessionId) {
+      if (uploadSessionId == null) {
+          return;
+      }
+
+      ImageUploadSession session = imageUploadSessionRepository.findById(uploadSessionId)
+              .orElseThrow(() -> new IllegalArgumentException("업로드 세션을 찾을 수 없습니다."));
+      boolean allFinalized = imageUploadItemRepository.findBySessionId(uploadSessionId).stream()
+              .allMatch(item -> item.getStatus().isFinalizedTerminal());
+      if (allFinalized) {
+          session.complete();
+      }
+  }
+
+  private void registerFinalizeImagesAfterCommit(List<FinalizeImageTask> tasks, Long uploadSessionId) {
+      Runnable finalizeImages = () -> {
+          for (FinalizeImageTask task : tasks) {
+              finalizeImage(task, uploadSessionId);
+          }
+          if (tasks.isEmpty()) {
+              new TransactionTemplate(transactionManager).executeWithoutResult(
+                      status -> completeUploadSessionIfAllImagesFinalized(uploadSessionId)
+              );
+          }
+      };
+
+      if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+          finalizeImages.run();
+          return;
+      }
+
+      TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+          @Override
+          public void afterCommit() {
+              finalizeImages.run();
+          }
+      });
+  }
+
+  private void finalizeImage(FinalizeImageTask task, Long uploadSessionId) {
+      boolean copied = false;
+      try {
+          ImageUploadItem item = imageUploadItemRepository.findById(task.imageUploadItemId())
+                  .orElseThrow(() -> new IllegalArgumentException("업로드 이미지를 찾을 수 없습니다."));
+          imageUploadStorageService.finalizeObject(item, task.finalObjectKey());
+          copied = true;
+
+          new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+              PerformanceLocation location = performanceLocationRepository.findById(task.performanceLocationId());
+              if (location == null) {
+                  throw new IllegalArgumentException("공연 장소를 찾을 수 없습니다.");
+              }
+              ImageUploadItem managedItem = imageUploadItemRepository.findById(task.imageUploadItemId())
+                      .orElseThrow(() -> new IllegalArgumentException("업로드 이미지를 찾을 수 없습니다."));
+
+              location.getImages().add(PerformanceLocationImage.builder().imageUrl(task.imageUrl()).build());
+              managedItem.confirm(task.finalObjectKey());
+              completeUploadSessionIfAllImagesFinalized(uploadSessionId);
+          });
+      } catch (RuntimeException e) {
+          if (copied) {
+              cleanupFinalObject(task.finalObjectKey());
+          }
+          markImageFinalizeFailed(task.imageUploadItemId(), uploadSessionId, e);
+          log.warn("Final image copy failed. itemId={}, finalObjectKey={}", task.imageUploadItemId(), task.finalObjectKey(), e);
+      }
+  }
+
+  private void cleanupFinalObject(String finalObjectKey) {
+      try {
+          imageUploadStorageService.deleteObject(finalObjectKey);
+      } catch (RuntimeException cleanupException) {
+          log.warn("Final image cleanup failed. finalObjectKey={}", finalObjectKey, cleanupException);
+      }
+  }
+
+  private void markImageFinalizeFailed(Long imageUploadItemId, Long uploadSessionId, RuntimeException cause) {
+      new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+          ImageUploadItem item = imageUploadItemRepository.findById(imageUploadItemId)
+                  .orElseThrow(() -> new IllegalArgumentException("업로드 이미지를 찾을 수 없습니다."));
+          item.markFinalizeFailed(truncateFailureReason(cause.getMessage()));
+          completeUploadSessionIfAllImagesFinalized(uploadSessionId);
+      });
+  }
+
+  private String truncateFailureReason(String reason) {
+      if (reason == null) {
+          return null;
+      }
+      return reason.length() > 500 ? reason.substring(0, 500) : reason;
+  }
+
+  private record FinalizeImageTask(
+          Long performanceLocationId,
+          Long imageUploadItemId,
+          String finalObjectKey,
+          String imageUrl
+  ) {
+  }
+
+  private ImageUploadItem getMatchedImageFile(String imageUrl, Map<String, ImageUploadItem> imageMap) {
+        String normalizedImageUrl = normalizeFileName(imageUrl);
+        ImageUploadItem exactMatch = imageMap.get(normalizedImageUrl);
+        if (exactMatch != null) {
+            return exactMatch;
+        }
+
+        for (Map.Entry<String, ImageUploadItem> entry : imageMap.entrySet()) {
             String fileName = entry.getKey();
-            if (fileName.startsWith(imageUrl)) {
+            if (fileName.startsWith(normalizedImageUrl)) {
                 return entry.getValue();
             }
         }
-        throw new RuntimeException("폴더 내에 '" + imageUrl + "' 파일이 없습니다.");
+        throw new RuntimeException("READY 상태의 매칭 이미지가 없습니다: " + imageUrl);
+    }
+
+    private String normalizeFileName(String fileName) {
+        return fileName == null ? "" : fileName.trim().toLowerCase();
     }
 
     private void validateRequiredFields(UploadDto dto) {
@@ -166,7 +303,7 @@ public class PerformanceLocationExcelService {
         }
     }
 
-    private void saveEntity(UploadDto dto, Coordinate coordinate, String s3Url) {
+    private PerformanceLocation saveEntity(UploadDto dto, Coordinate coordinate, String s3Url) {
         List<PerformanceLocationImage> images = new ArrayList<>();
         if (StringUtils.hasText(s3Url)) {
             images.add(PerformanceLocationImage.builder().imageUrl(s3Url).build());
@@ -200,6 +337,8 @@ public class PerformanceLocationExcelService {
         if (!guides.isEmpty()) {
             applicationGuideRepository.saveAll(guides);
         }
+
+        return savedLocation;
     }
 
     private void printFinalReport(int successCount, List<String> failedLogs) {

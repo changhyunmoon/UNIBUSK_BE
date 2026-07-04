@@ -80,10 +80,12 @@ public class ImageUploadItem extends BaseTimeEntity {
     }
 
     public boolean canIssuePresignedUrl() {
-        return (status == ImageUploadItemStatus.PENDING
-                || status == ImageUploadItemStatus.UPLOADING
-                || status == ImageUploadItemStatus.UPLOAD_FAILED)
+        return canMarkUploadFailed()
                 && presignedUrlIssueCount < MAX_PRESIGNED_URL_ISSUE_COUNT;
+    }
+
+    public boolean isPresignedUrlIssueLimitReached() {
+        return presignedUrlIssueCount >= MAX_PRESIGNED_URL_ISSUE_COUNT;
     }
 
     public void markPresignedUrlIssued() {
@@ -95,13 +97,37 @@ public class ImageUploadItem extends BaseTimeEntity {
         this.status = ImageUploadItemStatus.UPLOADING;
     }
 
+    public boolean canCompleteUpload() {
+        return this.status == ImageUploadItemStatus.UPLOADING
+                || this.status == ImageUploadItemStatus.UPLOADED;
+    }
+
+    public void validateUploadCompletable() {
+        if (!canCompleteUpload()) {
+            throw new IllegalStateException("업로드 완료 처리가 불가능한 상태입니다. 현재 상태: " + this.status);
+        }
+    }
+
     public void markUploaded() {
-        if (this.status == ImageUploadItemStatus.UPLOADING) {
-            this.status = ImageUploadItemStatus.UPLOADED;
+        validateUploadCompletable();
+        this.status = ImageUploadItemStatus.UPLOADED;
+        this.failureReason = null;
+    }
+
+    public boolean canMarkUploadFailed() {
+        return this.status == ImageUploadItemStatus.PENDING
+                || this.status == ImageUploadItemStatus.UPLOADING
+                || this.status == ImageUploadItemStatus.UPLOAD_FAILED;
+    }
+
+    public void validateUploadFailMarkable() {
+        if (!canMarkUploadFailed()) {
+            throw new IllegalStateException("업로드 실패 처리가 불가능한 상태입니다. 현재 상태: " + this.status);
         }
     }
 
     public void markUploadFailed(String reason) {
+        validateUploadFailMarkable();
         this.status = ImageUploadItemStatus.UPLOAD_FAILED;
         this.failureReason = reason;
     }

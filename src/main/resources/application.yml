@@ -6,9 +6,30 @@ spring:
 
 server:
   shutdown: graceful
+  servlet:
+    context-path: /api
 
----
-spring:
-  config:
-    activate:
-      on-profile: prod
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+swagger:
+  server:
+    local: http://localhost:8080/api
+    dev: https://dev.unibusk.site/api
+    prod: https://unibusk.site/api
+
+jwt:
+  expiration-time:
+    access-token: 3600
+    refresh-token: 1209600
+
+image-upload:
+  presigned-url-expiration-minutes: 15
+  local-root: ./build/local-image-uploads

@@ -20,4 +20,12 @@ public enum ImageUploadItemStatus {
                 || this == OPTIMIZE_FAILED
                 || this == UPLOAD_FAILED;
     }
+
+    public boolean isFinalizedTerminal() {
+        return this == CONFIRMED
+                || this == FINALIZE_FAILED
+                || this == VALIDATION_FAILED
+                || this == OPTIMIZE_FAILED
+                || this == UPLOAD_FAILED;
+    }
 }
