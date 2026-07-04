@@ -9,6 +9,7 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 
 @Configuration
 public class S3Config {
@@ -27,6 +28,20 @@ public class S3Config {
         var builder = S3Client.builder()
                 .region(Region.of(region))
                 .httpClient(UrlConnectionHttpClient.create());
+        if (accessKey != null && !accessKey.isBlank()
+                && secretKey != null && !secretKey.isBlank()) {
+            AwsBasicCredentials awsCreds = AwsBasicCredentials.create(accessKey, secretKey);
+            builder.credentialsProvider(StaticCredentialsProvider.create(awsCreds));
+        } else {
+            builder.credentialsProvider(DefaultCredentialsProvider.create());
+        }
+        return builder.build();
+    }
+
+    @Bean
+    public S3Presigner s3Presigner() {
+        var builder = S3Presigner.builder()
+                .region(Region.of(region));
         if (accessKey != null && !accessKey.isBlank()
                 && secretKey != null && !secretKey.isBlank()) {
             AwsBasicCredentials awsCreds = AwsBasicCredentials.create(accessKey, secretKey);

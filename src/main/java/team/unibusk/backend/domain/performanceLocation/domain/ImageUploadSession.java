@@ -50,7 +50,10 @@ public class ImageUploadSession extends BaseTimeEntity {
     }
 
     public void markUploaded() {
-        this.status = ImageUploadSessionStatus.UPLOADED;
+        if (this.status == ImageUploadSessionStatus.CREATED
+                || this.status == ImageUploadSessionStatus.UPLOADING) {
+            this.status = ImageUploadSessionStatus.UPLOADED;
+        }
     }
 
     public void startProcessing() {
@@ -58,6 +61,10 @@ public class ImageUploadSession extends BaseTimeEntity {
                 || this.status == ImageUploadSessionStatus.UPLOADING) {
             this.status = ImageUploadSessionStatus.PROCESSING;
         }
+    }
+
+    public void markReady() {
+        this.status = ImageUploadSessionStatus.READY;
     }
 
     public void complete() {
