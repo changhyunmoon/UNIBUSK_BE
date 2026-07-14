@@ -78,7 +78,7 @@ dependencies {
     // =========================
     // 파일 처리
     // =========================
-    implementation 'org.apache.poi:poi-ooxml:5.2.3' // 엑셀 파일 생성/읽기
+    implementation 'com.github.pjfanning:excel-streaming-reader:5.2.0' // 대용량 XLSX 스트리밍 읽기 (Apache POI 포함)
 
     // =========================
     // 비동기 / WebClient
