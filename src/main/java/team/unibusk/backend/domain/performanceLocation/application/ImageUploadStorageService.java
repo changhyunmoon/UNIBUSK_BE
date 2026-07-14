@@ -10,6 +10,9 @@ import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
 import team.unibusk.backend.domain.performanceLocation.domain.ImageUploadItem;
@@ -149,6 +152,25 @@ public class ImageUploadStorageService {
             return;
         }
         deleteS3(objectKey);
+    }
+
+    public void saveImportExcel(String objectKey, java.io.InputStream input, long size) {
+        if (isLocalMode()) {
+            Path target = resolveLocalPath(objectKey);
+            try { Files.createDirectories(target.getParent()); Files.copy(input, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING); }
+            catch (IOException e) { throw new IllegalStateException("엑셀 임시 저장에 실패했습니다.", e); }
+            return;
+        }
+        s3Client.putObject(PutObjectRequest.builder().bucket(bucket).key(objectKey)
+                .contentType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet").contentLength(size).build(), RequestBody.fromInputStream(input,size));
+    }
+
+    public java.io.InputStream openImportExcel(String objectKey) {
+        if (isLocalMode()) {
+            try { return Files.newInputStream(resolveLocalPath(objectKey)); }
+            catch (IOException e) { throw new IllegalStateException("임시 엑셀 파일을 열 수 없습니다.", e); }
+        }
+        return s3Client.getObject(GetObjectRequest.builder().bucket(bucket).key(objectKey).build());
     }
 
     private String createProcessedObjectKey(ImageUploadItem item) {

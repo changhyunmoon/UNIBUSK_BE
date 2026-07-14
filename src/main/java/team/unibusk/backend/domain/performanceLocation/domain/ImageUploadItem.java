@@ -162,4 +162,10 @@ public class ImageUploadItem extends BaseTimeEntity {
         this.status = ImageUploadItemStatus.FINALIZE_FAILED;
         this.failureReason = reason;
     }
+
+    public void markUnused() {
+        if (this.status == ImageUploadItemStatus.READY) {
+            this.status = ImageUploadItemStatus.UNUSED;
+        }
+    }
 }

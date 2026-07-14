@@ -22,6 +22,8 @@ public interface PerformanceLocationJpaRepository extends JpaRepository<Performa
     // 이름 일치하는 데이터가 있는지 확인
     Optional<PerformanceLocation> findByName(String name);
 
+    List<PerformanceLocation> findByNameIn(java.util.Collection<String> names);
+
 
     List<PerformanceLocation> findByIdIn(Set<Long> ids);
 
