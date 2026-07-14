@@ -1,9 +1,10 @@
 package team.unibusk.backend.domain.performanceLocation.application;
 
+import com.github.pjfanning.xlsx.StreamingReader;
+import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -44,62 +45,87 @@ public class PerformanceLocationExcelService {
     private final ImageUploadSessionJpaRepository imageUploadSessionRepository;
     private final ImageUploadStorageService imageUploadStorageService;
     private final PlatformTransactionManager transactionManager;
+    private final EntityManager entityManager;
 
     private static final DataFormatter FORMATTER = new DataFormatter();
+    private static final int ROW_CACHE_SIZE = 100;
+    private static final int INPUT_BUFFER_SIZE = 4096;
+    private static final int JPA_CLEAR_SIZE = 500;
 
     @Transactional
     public PerformanceLocationExcelResponse uploadPerformanceLocationExcelData(MultipartFile excelFile, Long uploadSessionId) throws IOException {
 
         // 검증 및 데이터 준비
         validateExcelFile(excelFile);
-        List<UploadDto> dtos = getExcelDtoFromExcel(excelFile);
         Map<String, ImageUploadItem> imageMap = createReadyImageMap(uploadSessionId);
 
         List<String> failedLogs = new ArrayList<>();
         List<FinalizeImageTask> finalizeImageTasks = new ArrayList<>();
+        Set<String> namesInExcel = new HashSet<>();
         int successCount = 0;
 
-        // 각 행별 순차 처리
-        for (UploadDto dto : dtos) {
-            int actualRowNum = dto.rowNum();
+        // 전체 엑셀을 메모리에 올리지 않고, 제한된 수의 행만 캐시하면서 순차적으로 읽는다.
+        try (Workbook workbook = StreamingReader.builder()
+                .rowCacheSize(ROW_CACHE_SIZE)
+                .bufferSize(INPUT_BUFFER_SIZE)
+                .open(excelFile.getInputStream())) {
+            Sheet sheet = workbook.getSheetAt(0);
 
-            try {
-                // [검증 1] 필수 필드 체크
-                validateRequiredFields(dto);
+            for (Row row : sheet) {
+                // 첫 번째 행은 헤더이므로 건너뛴다.
+                if (row.getRowNum() == 0 || isRowEmpty(row)) continue;
 
-                // [검증 2] 이름 중복 체크
-                checkAlreadyExists(dto.name());
+                UploadDto dto = convertToUploadDto(row);
+                int actualRowNum = dto.rowNum();
 
-                // [데이터 변환] 주소 -> 좌표(위경도) 변환
-                Coordinate coordinate = geocodingService.getCoordinateByAddress(dto.address());
+                try {
+                    // [검증 1] 필수 필드 체크
+                    validateRequiredFields(dto);
 
-                // [이미지 처리] 엑셀 파일명에 맞는 이미지 찾기 및 S3 업로드
-                String s3Url = null;
-                ImageUploadItem matchedImage = null;
-                String finalObjectKey = null;
-                if (StringUtils.hasText(dto.imageUrl())) {
-                    matchedImage = getMatchedImageFile(dto.imageUrl(), imageMap);
-                    finalObjectKey = imageUploadStorageService.createFinalObjectKey(matchedImage);
-                    s3Url = imageUploadStorageService.createPublicUrl(finalObjectKey);
+                    // 같은 엑셀 파일 안의 중복은 DB 조회 전에 메모리에서 빠르게 차단한다.
+                    if (!namesInExcel.add(dto.name())) {
+                        throw new IllegalArgumentException("엑셀 파일 내에 중복된 장소 이름입니다.");
+                    }
+
+                    // [검증 2] DB에 이미 등록된 이름인지 체크
+                    checkAlreadyExists(dto.name());
+
+                    // [데이터 변환] 주소 -> 좌표(위경도) 변환
+                    Coordinate coordinate = geocodingService.getCoordinateByAddress(dto.address());
+
+                    // [이미지 처리] 엑셀 파일명에 맞는 READY 상태 이미지 찾기
+                    String s3Url = null;
+                    ImageUploadItem matchedImage = null;
+                    String finalObjectKey = null;
+                    if (StringUtils.hasText(dto.imageUrl())) {
+                        matchedImage = getMatchedImageFile(dto.imageUrl(), imageMap);
+                        finalObjectKey = imageUploadStorageService.createFinalObjectKey(matchedImage);
+                        s3Url = imageUploadStorageService.createPublicUrl(finalObjectKey);
+                    }
+
+                    // 기존 JPA 저장 방식을 유지하여 도메인 저장 규칙과 코드 일관성을 보존한다.
+                    PerformanceLocation savedLocation = saveEntity(dto, coordinate, null);
+                    if (matchedImage != null) {
+                        finalizeImageTasks.add(new FinalizeImageTask(
+                                savedLocation.getId(),
+                                matchedImage.getId(),
+                                finalObjectKey,
+                                s3Url
+                        ));
+                    }
+                    successCount++;
+
+                    // 대량 처리 중 1차 캐시가 계속 커지지 않도록 일정 건수마다 DB 반영 후 비운다.
+                    if (successCount % JPA_CLEAR_SIZE == 0) {
+                        entityManager.flush();
+                        entityManager.clear();
+                    }
+                } catch (DataIntegrityViolationException e) {
+                    failedLogs.add(String.format("[Row %d] [장소: %s] 실패: DB 제약 조건 위반(중복 가능성)", actualRowNum, dto.name()));
+                } catch (Exception e) {
+                    String reason = e.getMessage() != null ? e.getMessage() : "알 수 없는 에러";
+                    failedLogs.add(String.format("[Row %d] [장소: %s] 실패: %s", actualRowNum, dto.name(), reason));
                 }
-
-                // [최종 저장] DB에 엔티티 저장
-                PerformanceLocation savedLocation = saveEntity(dto, coordinate, null);
-                if (matchedImage != null) {
-                    finalizeImageTasks.add(new FinalizeImageTask(
-                            savedLocation.getId(),
-                            matchedImage.getId(),
-                            finalObjectKey,
-                            s3Url
-                    ));
-                }
-                successCount++;
-
-            } catch (DataIntegrityViolationException e) {
-                failedLogs.add(String.format("[Row %d] [장소: %s] 실패: DB 제약 조건 위반(중복 가능성)", actualRowNum, dto.name()));
-            } catch (Exception e) {
-                String reason = e.getMessage() != null ? e.getMessage() : "알 수 없는 에러";
-                failedLogs.add(String.format("[Row %d] [장소: %s] 실패: %s", actualRowNum, dto.name(), reason));
             }
         }
 
@@ -128,30 +154,20 @@ public class PerformanceLocationExcelService {
         }
     }
 
-    private List<UploadDto> getExcelDtoFromExcel(MultipartFile file) throws IOException {
-        List<UploadDto> dtos = new ArrayList<>();
-        try (Workbook workbook = new XSSFWorkbook(file.getInputStream())) {
-            Sheet sheet = workbook.getSheetAt(0);
-            for (int i = 1; i <= sheet.getLastRowNum(); i++) {
-                Row row = sheet.getRow(i);
-                if (row == null || isRowEmpty(row)) continue;
-
-                dtos.add(UploadDto.builder()
-                        .rowNum(row.getRowNum() + 1)
-                        .name(getCellValue(row, 0))
-                        .address(getCellValue(row, 1))
-                        .operatorName(getCellValue(row, 2))
-                        .operatorPhoneNumber(getCellValue(row, 3))
-                        .availableHours(getCellValue(row, 4))
-                        .operatorUrl(getCellValue(row, 5))
-                        .imageUrl(getCellValue(row, 6))
-                        .guide1(getCellValue(row, 7))
-                        .guide2(getCellValue(row, 8))
-                        .guide3(getCellValue(row, 9))
-                        .build());
-            }
-        }
-        return dtos;
+    private UploadDto convertToUploadDto(Row row) {
+        return UploadDto.builder()
+                .rowNum(row.getRowNum() + 1)
+                .name(getCellValue(row, 0))
+                .address(getCellValue(row, 1))
+                .operatorName(getCellValue(row, 2))
+                .operatorPhoneNumber(getCellValue(row, 3))
+                .availableHours(getCellValue(row, 4))
+                .operatorUrl(getCellValue(row, 5))
+                .imageUrl(getCellValue(row, 6))
+                .guide1(getCellValue(row, 7))
+                .guide2(getCellValue(row, 8))
+                .guide3(getCellValue(row, 9))
+                .build();
     }
 
     private String getCellValue(Row row, int index) {
