@@ -31,6 +31,8 @@ public class ImageUploadSession extends BaseTimeEntity {
     @Column(nullable = false)
     private LocalDateTime expiresAt;
 
+    private Long importJobId;
+
     @Builder
     private ImageUploadSession(
             int totalItemCount,
@@ -69,6 +71,21 @@ public class ImageUploadSession extends BaseTimeEntity {
 
     public void complete() {
         this.status = ImageUploadSessionStatus.COMPLETED;
+    }
+
+    public void claimForImport(Long importJobId) {
+        if (this.status != ImageUploadSessionStatus.READY) {
+            throw new IllegalStateException("READY 상태의 이미지 세션만 사용할 수 있습니다.");
+        }
+        this.status = ImageUploadSessionStatus.IMPORTING;
+        this.importJobId = importJobId;
+    }
+
+    public void releaseImport() {
+        if (this.status == ImageUploadSessionStatus.IMPORTING) {
+            this.status = ImageUploadSessionStatus.READY;
+            this.importJobId = null;
+        }
     }
 
     public void expire() {

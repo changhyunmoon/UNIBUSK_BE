@@ -10,12 +10,14 @@ public enum ImageUploadItemStatus {
     VALIDATION_FAILED,
     OPTIMIZE_FAILED,
     CONFIRMED,
-    FINALIZE_FAILED;
+    FINALIZE_FAILED,
+    UNUSED;
 
     public boolean isTerminal() {
         return this == READY
                 || this == CONFIRMED
                 || this == FINALIZE_FAILED
+                || this == UNUSED
                 || this == VALIDATION_FAILED
                 || this == OPTIMIZE_FAILED
                 || this == UPLOAD_FAILED;
